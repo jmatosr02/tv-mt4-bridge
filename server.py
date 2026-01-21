@@ -7,11 +7,18 @@ import requests
 app = Flask(__name__)
 
 # -----------------------
-# ENV
+# ENV (SIEMPRE desde Render)
 # -----------------------
-SECRET = os.getenv("SECRET", "")
-TG_TOKEN = os.getenv("TG_TOKEN", "")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+def get_env():
+    """
+    Lee variables de entorno.
+    - TG_BOT_TOKEN es el nombre correcto (como lo tienes en Render)
+    - TG_TOKEN se deja como fallback por compatibilidad
+    """
+    secret = os.getenv("SECRET", "").strip()
+    tg_token = (os.getenv("TG_BOT_TOKEN", "") or os.getenv("TG_TOKEN", "")).strip()
+    tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
+    return secret, tg_token, tg_chat_id
 
 # -----------------------
 # In-memory queue
@@ -23,20 +30,23 @@ def now_iso():
     return datetime.utcnow().isoformat() + "Z"
 
 def ok_env():
+    secret, tg_token, tg_chat_id = get_env()
     return {
-        "has_secret": bool(SECRET),
-        "has_tg_token": bool(TG_TOKEN),
-        "has_tg_chat": bool(TG_CHAT_ID),
+        "has_secret": bool(secret),
+        "has_tg_token": bool(tg_token),
+        "has_tg_chat": bool(tg_chat_id),
     }
 
 def tg_send(text: str) -> bool:
     """Send Telegram message. Returns True/False."""
-    if not (TG_TOKEN and TG_CHAT_ID):
+    _, tg_token, tg_chat_id = get_env()
+    if not (tg_token and tg_chat_id):
         return False
+
     try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
         payload = {
-            "chat_id": TG_CHAT_ID,
+            "chat_id": tg_chat_id,
             "text": text,
             "disable_web_page_preview": True,
         }
@@ -46,7 +56,8 @@ def tg_send(text: str) -> bool:
         return False
 
 def auth_ok(req_json: dict) -> bool:
-    return bool(SECRET) and req_json.get("secret") == SECRET
+    secret, _, _ = get_env()
+    return bool(secret) and req_json.get("secret") == secret
 
 # -----------------------
 # ROUTES
@@ -55,6 +66,7 @@ def auth_ok(req_json: dict) -> bool:
 def health():
     with _lock:
         pending = len(_queue)
+
     return jsonify({
         "ok": True,
         "pending": pending,
@@ -142,8 +154,10 @@ def tg_ping():
     Quick Telegram test.
     Visit in browser: /tg_ping?secret=...
     """
-    req_secret = request.args.get("secret", "")
-    if not (SECRET and req_secret == SECRET):
+    req_secret = request.args.get("secret", "").strip()
+    secret, _, _ = get_env()
+
+    if not (secret and req_secret == secret):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     ok = tg_send("✅ Ping OK desde tu bridge (Render).")
@@ -164,7 +178,7 @@ def trade_event():
       "price": 1234.56,
       "sl": 1230.00,
       "tp": 1240.00,
-      "profit": -4.20,           (CLOSE only)
+      "profit": -4.20,              (CLOSE only)
       "reason": "TP|SL|MANUAL|OTHER" (CLOSE only)
     }
     """
