@@ -1,278 +1,213 @@
-import os
-import time
-import uuid
-from collections import deque
-
-import requests
 from flask import Flask, request, jsonify
+from datetime import datetime
+import threading
+import os
+import requests
 
 app = Flask(__name__)
 
-# =========================
+# -----------------------
 # ENV
-# =========================
-SECRET = os.environ.get("SECRET", "")
+# -----------------------
+SECRET = os.getenv("SECRET", "")
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+# -----------------------
+# In-memory queue
+# -----------------------
+_queue = []
+_lock = threading.Lock()
 
-# =========================
-# IN-MEMORY STATE
-# =========================
-QUEUE = deque(maxlen=200)   # guarda ids en orden
-SIGNALS = {}                # id -> signal dict
+def now_iso():
+    return datetime.utcnow().isoformat() + "Z"
 
-
-def bad(msg, code=400):
-    return jsonify({"ok": False, "error": msg}), code
-
-
-def tg_api(method: str, payload: dict):
-    """
-    Llama Telegram Bot API usando el token que está corriendo en Render.
-    Retorna JSON dict o None si falla.
-    """
-    if not TG_BOT_TOKEN:
-        return {"ok": False, "error": "TG_BOT_TOKEN missing"}
-
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}"
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        # Telegram siempre responde JSON
-        return r.json()
-    except Exception as e:
-        return {"ok": False, "error": f"exception: {str(e)}"}
-
-
-def tg_send_approval(signal: dict):
-    """
-    Envía mensaje con botones Aceptar / Denegar al chat autorizado.
-    """
-    if not TG_CHAT_ID:
-        return
-
-    sid = signal["id"]
-    symbol = signal.get("symbol", "")
-    side = signal.get("side", "")
-    ordertype = signal.get("ordertype", "")
-    timeframe = signal.get("timeframe", "")
-    strategy = signal.get("strategy", "")
-    price = signal.get("price")
-
-    txt = (
-        "📌 *Señal pendiente*\n"
-        f"*Symbol:* {symbol}\n"
-        f"*Side:* {side}\n"
-        f"*Type:* {ordertype}\n"
-        + (f"*Price:* {price}\n" if price else "")
-        + f"*TF:* {timeframe}\n"
-        f"*Strategy:* {strategy}\n\n"
-        "Responde con los botones:"
-    )
-
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "✅ ACEPTAR", "callback_data": f"APPROVE:{sid}"},
-                {"text": "❌ DENEGAR", "callback_data": f"DENY:{sid}"},
-            ]
-        ]
+def ok_env():
+    return {
+        "has_secret": bool(SECRET),
+        "has_tg_token": bool(TG_TOKEN),
+        "has_tg_chat": bool(TG_CHAT_ID),
     }
 
-    tg_api(
-        "sendMessage",
-        {
+def tg_send(text: str) -> bool:
+    """Send Telegram message. Returns True/False."""
+    if not (TG_TOKEN and TG_CHAT_ID):
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+        payload = {
             "chat_id": TG_CHAT_ID,
-            "text": txt,
-            "parse_mode": "Markdown",
-            "reply_markup": keyboard,
-        },
-    )
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, json=payload, timeout=15)
+        return r.ok
+    except Exception:
+        return False
 
+def auth_ok(req_json: dict) -> bool:
+    return bool(SECRET) and req_json.get("secret") == SECRET
 
-# =========================
-# HEALTH
-# =========================
+# -----------------------
+# ROUTES
+# -----------------------
 @app.get("/health")
 def health():
-    return jsonify(
-        {
-            "ok": True,
-            "pending": len(QUEUE),
-            "has_secret": bool(SECRET),
-            "has_tg_token": bool(TG_BOT_TOKEN),
-            "has_tg_chat": bool(TG_CHAT_ID),
-        }
-    )
+    with _lock:
+        pending = len(_queue)
+    return jsonify({
+        "ok": True,
+        "pending": pending,
+        **ok_env(),
+        "time": now_iso(),
+    })
 
-
-# =========================
-# TELEGRAM TEST (IMPORTANT)
-# =========================
-@app.get("/tg_test")
-def tg_test():
-    """
-    Envía un mensaje usando el TG_BOT_TOKEN que está ACTIVO en Render.
-    Si aquí falla con 401 => Render tiene token viejo o mal pegado.
-    """
-    if not TG_CHAT_ID:
-        return jsonify({"ok": False, "error": "TG_CHAT_ID missing"}), 400
-
-    resp = tg_api("sendMessage", {"chat_id": TG_CHAT_ID, "text": "✅ TG_TEST desde Render"})
-    return jsonify({"ok": True, "telegram_response": resp})
-
-
-# =========================
-# TRADINGVIEW WEBHOOK
-# =========================
 @app.post("/tv")
-def tv_webhook():
+def tv():
+    """
+    Receives TradingView webhook JSON and queues it.
+    IMPORTANT: No Telegram here (signals do NOT notify).
+    Expected JSON:
+      secret, symbol, side, ordertype, timeframe, strategy
+    Optional:
+      price (for limit/stop), meta (string)
+    """
     data = request.get_json(silent=True) or {}
+    if not auth_ok(data):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    if not SECRET:
-        return bad("server SECRET not set", 500)
+    # Minimal validation
+    symbol = str(data.get("symbol", "")).strip()
+    side = str(data.get("side", "")).strip().lower()
+    ordertype = str(data.get("ordertype", "market")).strip().lower()
 
-    if data.get("secret") != SECRET:
-        return bad("unauthorized", 401)
+    if symbol == "" or side not in ("buy", "sell"):
+        return jsonify({"ok": False, "error": "bad_request"}), 400
 
-    symbol = (data.get("symbol") or "").strip()
-    side = (data.get("side") or "").lower().strip()
-    ordertype = (data.get("ordertype") or "").lower().strip()
-    timeframe = str(data.get("timeframe") or "").strip()
-    strategy = (data.get("strategy") or "").strip()
-    price = data.get("price", None)
-
-    if not symbol:
-        return bad("missing symbol")
-    if side not in ("buy", "sell"):
-        return bad("invalid side")
-    if not ordertype:
-        return bad("missing ordertype")
-
-    sid = str(uuid.uuid4())
-    signal = {
-        "id": sid,
+    item = {
+        "id": f"sig_{int(datetime.utcnow().timestamp()*1000)}",
+        "ts": now_iso(),
         "symbol": symbol,
         "side": side,
         "ordertype": ordertype,
-        "timeframe": timeframe,
-        "strategy": strategy,
-        "price": price,
-        "ts": int(time.time()),
-        "status": "pending",  # pending -> approved/denied
+        "timeframe": str(data.get("timeframe", "")),
+        "strategy": str(data.get("strategy", "")),
+        "price": data.get("price"),
+        "meta": data.get("meta", ""),
     }
 
-    SIGNALS[sid] = signal
-    QUEUE.append(sid)
+    with _lock:
+        _queue.append(item)
 
-    # Envía Telegram con botones
-    tg_send_approval(signal)
+    return jsonify({"ok": True, "queued": item["id"]})
 
-    return jsonify({"ok": True, "id": sid, "pending": len(QUEUE)})
-
-
-# =========================
-# NEXT SIGNAL
-# =========================
 @app.get("/next")
 def next_signal():
-    """
-    Devuelve la próxima señal en cola.
-    El EA debe operar SOLO si status == "approved".
-    """
-    if not QUEUE:
-        return jsonify({"ok": True, "signal": None})
+    """Returns the next queued signal without removing it."""
+    with _lock:
+        if not _queue:
+            return jsonify({"ok": True, "signal": None})
+        return jsonify({"ok": True, "signal": _queue[0]})
 
-    sid = QUEUE[0]
-    sig = SIGNALS.get(sid)
-    if not sig:
-        QUEUE.popleft()
-        return jsonify({"ok": True, "signal": None})
-
-    return jsonify({"ok": True, "signal": sig})
-
-
-# =========================
-# POP (remove a specific signal)
-# =========================
 @app.post("/pop")
 def pop_signal():
+    """
+    Removes a signal by id (or pops first if id not provided).
+    Body: { "secret": "...", "id": "sig_..." }
+    """
     data = request.get_json(silent=True) or {}
-    if data.get("secret") != SECRET:
-        return bad("unauthorized", 401)
+    if not auth_ok(data):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    sid = data.get("id")
-    if not sid:
-        return bad("missing id")
+    sig_id = str(data.get("id", "")).strip()
 
-    try:
-        QUEUE.remove(sid)
-    except Exception:
-        pass
+    with _lock:
+        if not _queue:
+            return jsonify({"ok": True, "removed": None})
 
-    SIGNALS.pop(sid, None)
-    return jsonify({"ok": True, "pending": len(QUEUE)})
+        if sig_id == "":
+            removed = _queue.pop(0)
+            return jsonify({"ok": True, "removed": removed["id"]})
 
+        for i, s in enumerate(_queue):
+            if s.get("id") == sig_id:
+                _queue.pop(i)
+                return jsonify({"ok": True, "removed": sig_id})
 
-# =========================
-# TELEGRAM WEBHOOK (buttons)
-# =========================
-@app.post("/tg")
-def telegram_webhook():
-    upd = request.get_json(silent=True) or {}
+    return jsonify({"ok": True, "removed": None})
 
-    cq = upd.get("callback_query")
-    if not cq:
-        # No es botón, lo ignoramos
-        return jsonify({"ok": True})
+@app.get("/tg_ping")
+def tg_ping():
+    """
+    Quick Telegram test.
+    Visit in browser: /tg_ping?secret=...
+    """
+    req_secret = request.args.get("secret", "")
+    if not (SECRET and req_secret == SECRET):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    cb_id = cq.get("id")
-    data = cq.get("data", "")
+    ok = tg_send("✅ Ping OK desde tu bridge (Render).")
+    return jsonify({"ok": ok})
 
-    msg = cq.get("message", {}) or {}
-    chat = msg.get("chat", {}) or {}
-    chat_id = str(chat.get("id", ""))
+@app.post("/trade_event")
+def trade_event():
+    """
+    Telegram notifications ONLY for trade open/close.
+    Body:
+    {
+      "secret": "...",
+      "event": "OPEN" | "CLOSE",
+      "symbol": "XAUUSD.pro",
+      "side": "buy|sell",
+      "lot": 0.01,
+      "ticket": 12345,
+      "price": 1234.56,
+      "sl": 1230.00,
+      "tp": 1240.00,
+      "profit": -4.20,           (CLOSE only)
+      "reason": "TP|SL|MANUAL|OTHER" (CLOSE only)
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    if not auth_ok(data):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    # Seguridad: solo permitir tu chat
-    if TG_CHAT_ID and chat_id != str(TG_CHAT_ID):
-        tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "No autorizado"})
-        return jsonify({"ok": True})
+    event = str(data.get("event", "")).upper().strip()
+    symbol = str(data.get("symbol", "")).strip()
+    side = str(data.get("side", "")).strip().lower()
+    lot = data.get("lot", "")
+    ticket = data.get("ticket", "")
+    price = data.get("price", "")
+    sl = data.get("sl", "")
+    tp = data.get("tp", "")
 
-    if ":" not in data:
-        tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Acción inválida"})
-        return jsonify({"ok": True})
+    if event not in ("OPEN", "CLOSE"):
+        return jsonify({"ok": False, "error": "bad_event"}), 400
 
-    action, sid = data.split(":", 1)
-    sig = SIGNALS.get(sid)
-    if not sig:
-        tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Señal no encontrada"})
-        return jsonify({"ok": True})
-
-    if action == "APPROVE":
-        sig["status"] = "approved"
-        tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "✅ Aceptada"})
-        tg_api("sendMessage", {"chat_id": TG_CHAT_ID, "text": "✅ Señal aprobada. MT4 puede ejecutar en sesión."})
-
-    elif action == "DENY":
-        sig["status"] = "denied"
-        # Remover de cola y borrar
-        try:
-            QUEUE.remove(sid)
-        except Exception:
-            pass
-        SIGNALS.pop(sid, None)
-
-        tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "❌ Denegada"})
-        tg_api("sendMessage", {"chat_id": TG_CHAT_ID, "text": "❌ Señal denegada y removida."})
-
+    if event == "OPEN":
+        msg = (
+            f"📈 Trade ABIERTO\n"
+            f"• {symbol} ({side.upper()})\n"
+            f"• Lote: {lot}\n"
+            f"• Ticket: {ticket}\n"
+            f"• Entrada: {price}\n"
+            f"• SL: {sl}\n"
+            f"• TP: {tp}\n"
+        )
     else:
-        tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Acción inválida"})
+        profit = data.get("profit", "")
+        reason = str(data.get("reason", "OTHER")).upper().strip()
+        msg = (
+            f"✅ Trade CERRADO\n"
+            f"• {symbol} ({side.upper()})\n"
+            f"• Ticket: {ticket}\n"
+            f"• Cierre: {price}\n"
+            f"• P/L: {profit}\n"
+            f"• Razón: {reason}\n"
+        )
 
-    return jsonify({"ok": True})
+    ok = tg_send(msg)
+    return jsonify({"ok": ok})
 
-
-# =========================
-# MAIN
-# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
